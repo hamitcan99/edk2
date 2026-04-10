@@ -104,11 +104,31 @@ QEMU → OVMF → DXE phase → LvglDisplayEngineDxe (replaces DisplayEngineDxe)
 5. Handle callbacks via `EFI_HII_CONFIG_ACCESS_PROTOCOL`
 
 ## Mouse/Input Status
-- **SimplePointer**: ✅ Working (usb-mouse device in QEMU)
-- **AbsolutePointer**: ⚠️ Partially working — `UsbMouseAbsolutePointerDxe` added to OVMF
-  but QEMU `usb-tablet` uses `Subclass:0, Protocol:0` while driver expects
-  `Subclass:1 (Boot), Protocol:2 (Mouse)`. Use `usb-mouse` for now.
+- **AbsolutePointer**: ✅ Working with QEMU `usb-mouse` via `UsbMouseAbsolutePointerDxe`.
+  Note: this is *synthesized* absolute (the driver accumulates Boot Mouse relative
+  deltas internally) — not true 1:1 host→guest tracking. Cursor moves proportionally
+  to host motion but does not directly mirror the QEMU window's host pointer.
+- **SimplePointer**: Available as fallback in `lv_port_indev.c` if AbsolutePointer
+  is absent, but currently unused.
 - **Keyboard**: ✅ Working via `EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL`
+
+### How AbsolutePointer is wired
+- `OvmfPkgX64.fdf` and `OvmfPkg/Include/Dsc/UsbComponents.dsc.inc` include
+  `UsbMouseAbsolutePointerDxe` only — `UsbMouseDxe` is intentionally NOT included.
+- Reason: EDK2's `CoreConnectSingleController` sorts driver bindings by `Version`
+  field highest→lowest (`MdeModulePkg/Core/Dxe/Hand/DriverSupport.c:607-618`).
+  `UsbMouseDxe` has `Version=0xa`, `UsbMouseAbsolutePointerDxe` has `Version=0x1`,
+  so when both are present `UsbMouseDxe` binds first and locks UsbIo BY_DRIVER,
+  blocking AbsolutePointer. Removing `UsbMouseDxe` from the firmware lets the
+  AbsolutePointer driver bind unopposed.
+- `qemu_lvgl.sh` must use `-device usb-mouse` (Boot/Mouse, Subclass=1/Protocol=2)
+  — NOT `usb-tablet` (Subclass=0/Protocol=0), which neither edk2 mouse driver binds.
+
+### True 1:1 absolute tracking (not yet implemented)
+For real host-cursor mirroring with `usb-tablet`, a custom HID-class AbsolutePointer
+driver in `LvglPkg/` would be needed (parses usb-tablet's 16-bit absolute X/Y
+report descriptor, range 0..32767). Out of scope for now — synthesized absolute is
+sufficient for current LVGL development.
 
 ### Mouse Fix Applied (lv_port_indev.c)
 Original code used `ConsoleInHandle` to get pointer protocol — this only gets
@@ -116,8 +136,9 @@ the ConSplitter aggregate, not the real device. Fixed to use `LocateHandleBuffer
 with `DevicePath` filter to find actual USB device handles.
 
 ## Known Issues / TODO
-- [ ] AbsolutePointer with usb-tablet: `UsbMouseAbsolutePointerDxe` doesn't bind
-      to QEMU usb-tablet (descriptor mismatch: Subclass/Protocol 0x00 vs expected 0x01/0x02)
+- [ ] True 1:1 absolute tracking with `usb-tablet`: needs custom HID-class
+      AbsolutePointer driver in LvglPkg (current setup uses `usb-mouse` +
+      synthesized absolute, see Mouse/Input Status above)
 - [ ] Mouse wheel support
 - [ ] IFR Parser — not started yet (next major milestone)
 - [ ] DisplayEngineDxe replacement — after IFR parser
