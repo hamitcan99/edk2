@@ -2,7 +2,9 @@
 
 ## Project Goal
 Replace EDK2's native HII Form Browser (text-based UI) with an LVGL-based graphical renderer.
-The approach is **Runtime IFR Parser** — read HII database at runtime, parse IFR opcodes, and render the UI through LVGL instead of EDK2's DisplayEngineDxe.
+The approach is **Display Engine Replacement** — implement `EFI_DISPLAY_ENGINE_PROTOCOL` so that
+`SetupBrowserDxe` continues to do all IFR parsing, conditional evaluation, and config routing,
+while our code handles only the rendering layer via LVGL.
 
 ## Repository Structure
 ```
@@ -85,23 +87,136 @@ QEMU (x86_64, q35) → OVMF (EDK2) → UEFI Shell → LvglPkg .efi application
 ### Target Stack (end goal)
 ```
 QEMU → OVMF → DXE phase → LvglDisplayEngineDxe (replaces DisplayEngineDxe)
-                         → IFR Parser reads HII Database
-                         → LVGL renders forms
+                         → SetupBrowserDxe walks IFR, evaluates conditionals
+                         → LvglDisplayEngineDxe renders via LVGL
 ```
 
-### HII Architecture (what we're replacing)
-- VFR files → compiled to IFR binary at build time
-- IFR binary → published to HII Database via `EFI_HII_DATABASE_PROTOCOL`
-- HII Database → read by `SetupBrowserDxe` + `DisplayEngineDxe`
-- **Plan**: Replace `DisplayEngineDxe` with our LVGL renderer
-- **Key protocol**: `EFI_FORM_BROWSER2_PROTOCOL` is the interface boundary
+### HII Build-Time Pipeline
+```
+UNI files
+  │  (StrGather)
+  ▼
+STRING_TOKEN integers (.h) + string binary data
+  │
+VFR files  ←─ C preprocessor pulls in STRING_TOKEN integers here
+  │  (VfrCompile)
+  ▼
+IFR byte array (.c file)
+  │
+  │  compiled + linked into driver .efi
+  ▼
+Driver EntryPoint calls HiiAddPackages()
+  │
+  ▼
+EFI_HII_DATABASE_PROTOCOL  ← Forms package + Strings package stored here
+```
 
-### Runtime IFR Parser Approach
-1. Locate `EFI_HII_DATABASE_PROTOCOL`
-2. Call `ExportPackageLists` to get all registered packages
-3. Walk IFR opcodes (EFI_IFR_OP_HEADER based) to build form tree
-4. Map form tree → LVGL widgets
-5. Handle callbacks via `EFI_HII_CONFIG_ACCESS_PROTOCOL`
+Key point: by the time the C compiler sees anything, VFR and UNI are fully
+reduced to a `.h` of `#define` integers and a `.c` of a raw byte array.
+The C compiler has no idea they came from anything special.
+
+### HII Runtime Flow
+```
+BDS (user presses F2/DEL)
+  │  calls SendForm()
+  ▼
+EFI_FORM_BROWSER2_PROTOCOL  ← entry point, called by BDS
+(SetupBrowserDxe)             - walks IFR opcodes linearly
+                              - evaluates suppressif/grayoutif expressions
+                              - manages navigation state, save/discard/reset
+                              - calls driver for current values + saves
+  │
+  │  needs current values / user saves
+  ▼
+EFI_HII_CONFIG_ACCESS_PROTOCOL   ← your driver implements this
+  ExtractConfig()   ← browser asks: what are the current values?
+  RouteConfig()     ← browser says: user saved, write these values
+  Callback()        ← browser says: user changed question X interactively
+  │
+  │  needs to draw — THIS IS THE SEAM WE REPLACE
+  ▼
+EFI_DISPLAY_ENGINE_PROTOCOL      ← WE REPLACE THIS
+(DisplayEngineDxe → LvglDisplayEngineDxe)
+  FormDisplay()     ← receives FORM_DISPLAY_ENGINE_FORM, already parsed
+  ExitDisplay()     ← browser is closing
+  ConfirmDataChange() ← show save/discard popup
+  │
+  ▼
+LVGL
+  │  flush callback
+  ▼
+EFI_GRAPHICS_OUTPUT_PROTOCOL     ← pixels on screen
+```
+
+### Why We Replace DisplayEngineDxe — Not SetupBrowserDxe
+
+`EFI_DISPLAY_ENGINE_PROTOCOL` is the exact seam the EDK2 architects provided
+for this purpose. By the time `FormDisplay()` is called, SetupBrowserDxe has
+already done all the hard work:
+
+- IFR opcode walking
+- Scope stack management
+- Expression bytecode evaluation (suppressif / grayoutif / disableif)
+- Config string extraction via EFI_HII_CONFIG_ROUTING_PROTOCOL
+- String ID → text resolution via HiiGetString()
+- Navigation state
+
+`FormDisplay()` receives a `FORM_DISPLAY_ENGINE_FORM` containing a clean linked
+list of `FORM_DISPLAY_ENGINE_STATEMENT` structs — one per visible question, with
+current value, prompt string, help string, options list, and grayed/locked flags
+already resolved.
+
+We do NOT reimplement IFR parsing. SetupBrowserDxe handles it all.
+
+### Statement → LVGL Widget Mapping
+
+This is the core of our `FormDisplay()` implementation:
+
+| FORM_DISPLAY_ENGINE_STATEMENT OpCode | LVGL Widget            |
+|--------------------------------------|------------------------|
+| EFI_IFR_SUBTITLE                     | lv_label_create()      |
+| EFI_IFR_CHECKBOX                     | lv_checkbox_create()   |
+| EFI_IFR_NUMERIC                      | lv_spinbox_create()    |
+| EFI_IFR_ONE_OF                       | lv_dropdown_create()   |
+| EFI_IFR_ORDERED_LIST                 | lv_list_create()       |
+| EFI_IFR_STRING                       | lv_textarea_create()   |
+| EFI_IFR_PASSWORD                     | lv_textarea_create() + password mode |
+| EFI_IFR_REF (goto)                   | lv_btn_create()        |
+| EFI_IFR_ACTION                       | lv_btn_create()        |
+
+### LVGL on UEFI — Three Requirements
+
+```c
+// 1. Display flush — copy LVGL framebuffer to GOP
+void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *buf)
+{
+    // gop->Blt() to copy buf to framebuffer at area coordinates
+    lv_disp_flush_ready(drv);
+}
+
+// 2. Input — translate EFI input protocols to LVGL input device
+void lvgl_keyboard_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
+{
+    // read EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL
+    // translate EFI key codes → LVGL key codes
+}
+
+// 3. Tick — LVGL needs a millisecond tick source
+// call lv_tick_inc(ms_elapsed) via EFI_TIMER_EVENT or gBS->Stall()
+```
+
+### Platform DSC Change (the only platform file to touch)
+
+```ini
+# OvmfPkg/OvmfPkgX64.dsc — remove this:
+MdeModulePkg/Universal/DisplayEngineDxe/DisplayEngineDxe.inf
+
+# Add this:
+LvglPkg/LvglDisplayEngineDxe/LvglDisplayEngineDxe.inf
+```
+
+Everything above that line — UNI, VFR, IFR, HII database, SetupBrowserDxe,
+driver EFI_HII_CONFIG_ACCESS_PROTOCOL — is completely untouched.
 
 ## Mouse/Input Status
 - **AbsolutePointer**: ✅ Working with QEMU `usb-mouse` via `UsbMouseAbsolutePointerDxe`.
@@ -135,28 +250,43 @@ Original code used `ConsoleInHandle` to get pointer protocol — this only gets
 the ConSplitter aggregate, not the real device. Fixed to use `LocateHandleBuffer`
 with `DevicePath` filter to find actual USB device handles.
 
-## Known Issues / TODO
-- [ ] True 1:1 absolute tracking with `usb-tablet`: needs custom HID-class
-      AbsolutePointer driver in LvglPkg (current setup uses `usb-mouse` +
-      synthesized absolute, see Mouse/Input Status above)
-- [ ] Mouse wheel support
-- [ ] IFR Parser — not started yet (next major milestone)
-- [ ] DisplayEngineDxe replacement — after IFR parser
-
 ## Key Source Files
 ```
-# LVGL UEFI port
+# LVGL UEFI port (existing)
 LvglPkg/Library/LvglLib/lv_uefi_display.c   ← GOP flush callback
 LvglPkg/Library/LvglLib/lv_port_indev.c     ← Mouse + keyboard input
 LvglPkg/Library/LvglLib/LvglLib.c           ← Init/deinit, main loop
 
-# HII/IFR (what we'll be working with next)
-MdePkg/Include/Uefi/UefiInternalFormRepresentation.h  ← All IFR opcodes
-MdePkg/Include/Protocol/HiiDatabase.h                 ← HII DB protocol
-MdePkg/Include/Protocol/FormBrowser2.h                ← Form Browser protocol
-MdeModulePkg/Universal/DisplayEngineDxe/              ← Will be replaced
-MdeModulePkg/Universal/SetupBrowserDxe/               ← Form logic + IFR parser
-MdeModulePkg/Universal/DriverSampleDxe/               ← Best VFR/HII example
+# Display Engine — the seam we implement
+MdeModulePkg/Include/Protocol/DisplayProtocol.h         ← EFI_DISPLAY_ENGINE_PROTOCOL
+                                                          FORM_DISPLAY_ENGINE_FORM
+                                                          FORM_DISPLAY_ENGINE_STATEMENT
+MdeModulePkg/Universal/DisplayEngineDxe/FormDisplay.c  ← reference implementation to replace
+MdeModulePkg/Universal/DisplayEngineDxe/FormDisplay.h  ← internal helpers reference
+
+# SetupBrowserDxe — do NOT modify, just let it call us
+MdeModulePkg/Universal/SetupBrowserDxe/           ← IFR walker, expression evaluator
+
+# HII protocols — read-only reference
+MdePkg/Include/Uefi/UefiInternalFormRepresentation.h  ← All IFR opcodes + structures
+MdePkg/Include/Protocol/HiiDatabase.h                 ← EFI_HII_DATABASE_PROTOCOL
+MdePkg/Include/Protocol/FormBrowser2.h                ← EFI_FORM_BROWSER2_PROTOCOL
+                                                         (what BDS calls — not our concern)
+MdePkg/Include/Protocol/HiiConfigAccess.h             ← EFI_HII_CONFIG_ACCESS_PROTOCOL
+                                                         (driver-side, not our concern)
+
+# Reference VFR/HII driver
+MdeModulePkg/Universal/DriverSampleDxe/          ← Best VFR/HII example
+```
+
+## New Module to Create
+```
+LvglPkg/LvglDisplayEngineDxe/
+  LvglDisplayEngineDxe.c     ← produces/installs EFI_DISPLAY_ENGINE_PROTOCOL
+  LvglDisplayEngineDxe.inf   ← module INF
+  LvglFormRenderer.c         ← FormDisplay(): FORM_DISPLAY_ENGINE_FORM → LVGL widgets
+  LvglInput.c                ← EFI key/mouse events → LVGL input device
+  LvglFlush.c                ← LVGL flush_cb → GOP Blt (reuse LvglLib if possible)
 ```
 
 ## Toolchain Info
@@ -189,8 +319,37 @@ git rebase master
 3. Add forward declaration + `EFIAPI` wrapper for `lv_demo_keypad_encoder` in `LvglDemos.c`
 4. Fix mouse init to use `LocateHandleBuffer` instead of `ConsoleInHandle`
 
+## Current Status
+- LvglDisplayEngineDxe skeleton: **done** — builds, installs protocol, wired into DSC/FDF
+- LvglLib.inf fix: **done** — removed `UefiApplicationEntryPoint`, consumable by DXE_DRIVER
+- FormDisplay() initial implementation: **done** — walks StatementListHead, creates LVGL widgets,
+  runs event loop, returns user action to browser
+- LVGL-based form UI renders on screen in QEMU when entering Setup
+
+## Known Bugs
+1. **Mouse not working** — mouse cursor does not appear / respond in the display engine.
+   The mouse indev is created during `LvglLibConstructor` → `lv_port_indev_init()`, which
+   creates the cursor on `lv_screen_active()`. When `LvglRenderForm()` loads a new screen
+   via `lv_screen_load()`, the cursor image is on the old screen and gets orphaned.
+   Fix: re-create or reparent the mouse cursor after loading the new screen.
+2. **Arrow keys (UP/DOWN/LEFT/RIGHT) not working** — the keypad indev reads keys correctly
+   (`lv_port_indev.c` maps SCAN_UP → LV_KEY_UP etc.), but LVGL's default group navigation
+   uses LV_KEY_NEXT/LV_KEY_PREV (Tab/Shift-Tab). Arrow keys only work inside widgets
+   (e.g. spinbox increment). Need to either: (a) remap arrows to NEXT/PREV for group
+   navigation, or (b) enable `lv_group_set_editing()` style navigation, or (c) handle
+   arrows in a custom key event callback that moves focus.
+3. **ESC key not working** — `OnEscPressed` is registered on the screen object with
+   `LV_EVENT_KEY`, but the screen itself is not in the focus group and never receives
+   key events. Fix: register ESC handler on the group or on individual focused widgets,
+   or use `lv_group_add_obj()` on a hidden focusable object.
+4. **Fonts and colors need improvement** — current dark theme (0x1A1A2E / 0x16213E) is
+   placeholder. Text readability is poor, subtitle/label contrast is insufficient.
+   Need a proper theme pass: background, panel, text, accent, and disabled colors.
+   Font sizes should be consistent and appropriate for 800x600 resolution.
+
 ## Next Steps
-1. Open PR to YangGangUEFI/LvglPkg with the fixes above
-2. Study `SetupBrowserDxe` IFR parser implementation
-3. Write standalone IFR parser as a UEFI application (proof of concept)
-4. Integrate IFR parser output with LVGL widget creation
+1. Fix mouse support — ensure cursor is visible and functional on the form screen
+2. Fix keyboard navigation — arrow keys should move focus between form items
+3. Fix ESC key — should trigger BROWSER_ACTION_FORM_EXIT reliably
+4. Theme/styling pass — readable fonts, proper color palette, grayout styling
+5. End-to-end test — verify form navigation, value changes, and save/discard flow
