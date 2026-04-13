@@ -245,10 +245,13 @@ driver in `LvglPkg/` would be needed (parses usb-tablet's 16-bit absolute X/Y
 report descriptor, range 0..32767). Out of scope for now — synthesized absolute is
 sufficient for current LVGL development.
 
-### Mouse Fix Applied (lv_port_indev.c)
-Original code used `ConsoleInHandle` to get pointer protocol — this only gets
-the ConSplitter aggregate, not the real device. Fixed to use `LocateHandleBuffer`
-with `DevicePath` filter to find actual USB device handles.
+### Mouse Input Design (lv_port_indev.c)
+Uses `ConsoleInHandle` to get pointer protocols via ConSplitter aggregate.
+ConSplitter installs `EFI_ABSOLUTE_POINTER_PROTOCOL` on its VirtualHandle
+(= `gST->ConsoleInHandle`) at driver entry, then aggregates all physical
+devices as they bind. `GetState()` iterates the internal device list and
+rescales coordinates to a virtual range. This is the correct UEFI pattern
+— no need to use `LocateHandleBuffer` to find individual devices.
 
 ## Key Source Files
 ```
@@ -279,14 +282,13 @@ MdePkg/Include/Protocol/HiiConfigAccess.h             ← EFI_HII_CONFIG_ACCESS_
 MdeModulePkg/Universal/DriverSampleDxe/          ← Best VFR/HII example
 ```
 
-## New Module to Create
+## LvglDisplayEngineDxe Module (created)
 ```
 LvglPkg/LvglDisplayEngineDxe/
   LvglDisplayEngineDxe.c     ← produces/installs EFI_DISPLAY_ENGINE_PROTOCOL
   LvglDisplayEngineDxe.inf   ← module INF
   LvglFormRenderer.c         ← FormDisplay(): FORM_DISPLAY_ENGINE_FORM → LVGL widgets
-  LvglInput.c                ← EFI key/mouse events → LVGL input device
-  LvglFlush.c                ← LVGL flush_cb → GOP Blt (reuse LvglLib if possible)
+  LvglFormRenderer.h         ← Renderer types and API
 ```
 
 ## Toolchain Info
@@ -302,8 +304,12 @@ edk2 fork:
   branch: dev  ← active development
   branch: master ← tracks upstream tianocore/edk2
 
-LvglPkg fork:
-  branch: master ← active development
+LvglPkg fork (hamitcan99/LvglPkg):
+  branch: master         ← active development
+  branch: pr/gcc-fixes   ← PR #14: GCC build fixes + README
+  branch: pr/mouse-wheel ← PR #15: mouse wheel support
+  branch: pr/display-engine ← PR #16: LvglDisplayEngineDxe
+  upstream: YangGangUEFI/LvglPkg
 
 # Sync upstream edk2
 git checkout master
@@ -313,11 +319,11 @@ git checkout dev
 git rebase master
 ```
 
-## Fixes Contributed / Pending PR to YangGangUEFI/LvglPkg
-1. Remove unused `Status` variable in `lv_uefi_display.c` (`-Werror=unused-but-set-variable`)
-2. Add `EFIAPI` to `LvglUefiDemo` in `LvglDemoApp.c` (calling convention mismatch)
-3. Add forward declaration + `EFIAPI` wrapper for `lv_demo_keypad_encoder` in `LvglDemos.c`
-4. Fix mouse init to use `LocateHandleBuffer` instead of `ConsoleInHandle`
+## Upstream PRs to YangGangUEFI/LvglPkg
+- **PR #14** (pr/gcc-fixes): GCC build fixes + README update — `EFIAPI` fixes, unused variable, GCC build docs
+- **PR #15** (pr/mouse-wheel): Mouse wheel support — Z-axis tracking via ConsoleInHandle, ratchet threshold
+- **PR #16** (pr/display-engine): LvglDisplayEngineDxe — LVGL-based HII form renderer + screenshots
+- **PR #13** (closed): Original combined PR, split into #14/#15/#16 per maintainer request
 
 ## Current Status
 - LvglDisplayEngineDxe skeleton: **done** — builds, installs protocol, wired into DSC/FDF
