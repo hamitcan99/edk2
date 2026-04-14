@@ -309,6 +309,7 @@ LvglPkg fork (hamitcan99/LvglPkg):
   branch: pr/gcc-fixes   ← PR #14: GCC build fixes + README
   branch: pr/mouse-wheel ← PR #15: mouse wheel support
   branch: pr/display-engine ← PR #16: LvglDisplayEngineDxe
+  branch: pr/mouse-notify ← PR #17: lazy mouse indev via protocol notification
   upstream: YangGangUEFI/LvglPkg
 
 # Sync upstream edk2
@@ -323,6 +324,7 @@ git rebase master
 - **PR #14** (pr/gcc-fixes): GCC build fixes + README update — `EFIAPI` fixes, unused variable, GCC build docs
 - **PR #15** (pr/mouse-wheel): Mouse wheel support — Z-axis tracking via ConsoleInHandle, ratchet threshold
 - **PR #16** (pr/display-engine): LvglDisplayEngineDxe — LVGL-based HII form renderer + screenshots
+- **PR #17** (pr/mouse-notify): Lazy mouse indev creation via `RegisterProtocolNotify` — fixes unusable mouse when LvglLib is consumed by a DXE_DRIVER (USB not connected at constructor time)
 - **PR #13** (closed): Original combined PR, split into #14/#15/#16 per maintainer request
 
 ## Current Status
@@ -331,38 +333,45 @@ git rebase master
 - FormDisplay() initial implementation: **done** — walks StatementListHead, creates LVGL widgets,
   runs event loop, returns user action to browser
 - LVGL-based form UI renders on screen in QEMU when entering Setup
+- Mouse input fix: **done** — `lv_uefi_mouse_create()` idempotent, `lv_port_indev_init()`
+  registers a `RegisterProtocolNotify()` on `gEfiAbsolutePointerProtocolGuid` so the
+  mouse indev is created lazily when USB binds during BDS (PR #17)
+- Keyboard navigation: **done** — `OnNavKey` + `AddToNavGroup` in
+  `LvglFormRenderer.c` give UP/DOWN focus, ESC form-exit, and
+  ENTER-toggles-editing for spinbox/dropdown/textarea (LEFT/RIGHT adjust
+  value via LVGL encoder emulation while editing)
 
 ## Known Bugs
-1. **Mouse not working** — mouse cursor does not appear / respond in the display engine.
-   Root cause: `LvglLibConstructor` runs during DXE dispatch (before BDS `ConnectAll`),
-   so `EfiMouseInit()` finds no USB pointer protocols and returns `EFI_UNSUPPORTED` — no
-   mouse indev is ever created. By the time `FormDisplay()` runs, `UefiLvglInit()` short-
-   circuits (`mUefiLvglInitDone == TRUE`) and never retries.
-   Fix: `lv_uefi_mouse_create()` is now idempotent (early-returns if a pointer indev
-   already exists, calls `EfiMouseInit()` internally). `lv_port_indev_init()` registers
-   a protocol-install notification on `gEfiAbsolutePointerProtocolGuid` via
-   `gBS->RegisterProtocolNotify()` — when the USB mouse binds during BDS `ConnectAll`,
-   the callback fires and creates the indev. No change needed at the renderer boundary.
-   Note: LVGL's `lv_indev_set_cursor()` already reparents cursors to `layer_sys`,
-   so screen switching is not an issue.
-2. **Arrow keys (UP/DOWN/LEFT/RIGHT) not working** — the keypad indev reads keys correctly
-   (`lv_port_indev.c` maps SCAN_UP → LV_KEY_UP etc.), but LVGL's default group navigation
-   uses LV_KEY_NEXT/LV_KEY_PREV (Tab/Shift-Tab). Arrow keys only work inside widgets
-   (e.g. spinbox increment). Need to either: (a) remap arrows to NEXT/PREV for group
-   navigation, or (b) enable `lv_group_set_editing()` style navigation, or (c) handle
-   arrows in a custom key event callback that moves focus.
-3. **ESC key not working** — `OnEscPressed` is registered on the screen object with
-   `LV_EVENT_KEY`, but the screen itself is not in the focus group and never receives
-   key events. Fix: register ESC handler on the group or on individual focused widgets,
-   or use `lv_group_add_obj()` on a hidden focusable object.
+1. ~~**Arrow keys (UP/DOWN/LEFT/RIGHT) not working**~~ — **FIXED**. `OnNavKey`
+   in `LvglFormRenderer.c` is attached to every widget via `AddToNavGroup`
+   and converts UP→`lv_group_focus_prev`, DOWN→`lv_group_focus_next`, and
+   ENTER→`lv_group_set_editing(true)` for spinbox/dropdown/textarea. In
+   editing mode LEFT/RIGHT drive LVGL's encoder emulation to adjust the
+   value; ESC exits editing.
+2. ~~**ESC key not working**~~ — **FIXED**. ESC is now handled in
+   `OnNavKey` (per-widget LV_EVENT_KEY callback), which does receive key
+   events via `lv_group_send_data`. Non-editing ESC sets
+   `BROWSER_ACTION_FORM_EXIT`; editing ESC cancels editing.
+3. **`EFI_IFR_ORDERED_LIST_OP` not rendered** — "Change Boot Order" and
+   "Change Driver Order" forms come up empty because the statement switch
+   in `LvglFormRenderer.c:710-743` has no case for ordered-list opcodes.
+   Needs a `CreateOrderedListWidget` that walks `Statement->OptionListHead`
+   in current order, offers a reorder affordance (Move Up / Move Down or
+   drag), and writes the new order back into `Statement->CurrentValue` so
+   `RouteConfig` picks it up.
 4. **Fonts and colors need improvement** — current dark theme (0x1A1A2E / 0x16213E) is
    placeholder. Text readability is poor, subtitle/label contrast is insufficient.
    Need a proper theme pass: background, panel, text, accent, and disabled colors.
    Font sizes should be consistent and appropriate for 800x600 resolution.
+5. **Function-key hotkeys not wired** — `LvglFormRenderer.c` ignores
+   `FormData->HotKeyListHead`, so F9 (Load Defaults), F10 (Save), and any
+   driver-registered hotkeys do nothing. `lv_port_indev.c` also drops
+   `SCAN_F1..F12` silently and would need to surface them before the
+   renderer can walk the hotkey list and return the corresponding
+   `BROWSER_ACTION_*`.
 
 ## Next Steps
-1. Fix mouse support — ensure cursor is visible and functional on the form screen
-2. Fix keyboard navigation — arrow keys should move focus between form items
-3. Fix ESC key — should trigger BROWSER_ACTION_FORM_EXIT reliably
-4. Theme/styling pass — readable fonts, proper color palette, grayout styling
-5. End-to-end test — verify form navigation, value changes, and save/discard flow
+1. Implement `CreateOrderedListWidget` for Boot Order / Driver Order forms
+2. Surface F-keys from `lv_port_indev.c` and walk `HotKeyListHead` for F9/F10
+3. Theme/styling pass — readable fonts, proper color palette, grayout styling
+4. End-to-end test — verify form navigation, value changes, and save/discard flow
