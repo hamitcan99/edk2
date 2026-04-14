@@ -334,10 +334,17 @@ git rebase master
 
 ## Known Bugs
 1. **Mouse not working** — mouse cursor does not appear / respond in the display engine.
-   The mouse indev is created during `LvglLibConstructor` → `lv_port_indev_init()`, which
-   creates the cursor on `lv_screen_active()`. When `LvglRenderForm()` loads a new screen
-   via `lv_screen_load()`, the cursor image is on the old screen and gets orphaned.
-   Fix: re-create or reparent the mouse cursor after loading the new screen.
+   Root cause: `LvglLibConstructor` runs during DXE dispatch (before BDS `ConnectAll`),
+   so `EfiMouseInit()` finds no USB pointer protocols and returns `EFI_UNSUPPORTED` — no
+   mouse indev is ever created. By the time `FormDisplay()` runs, `UefiLvglInit()` short-
+   circuits (`mUefiLvglInitDone == TRUE`) and never retries.
+   Fix: `lv_uefi_mouse_create()` is now idempotent (early-returns if a pointer indev
+   already exists, calls `EfiMouseInit()` internally). `lv_port_indev_init()` registers
+   a protocol-install notification on `gEfiAbsolutePointerProtocolGuid` via
+   `gBS->RegisterProtocolNotify()` — when the USB mouse binds during BDS `ConnectAll`,
+   the callback fires and creates the indev. No change needed at the renderer boundary.
+   Note: LVGL's `lv_indev_set_cursor()` already reparents cursors to `layer_sys`,
+   so screen switching is not an issue.
 2. **Arrow keys (UP/DOWN/LEFT/RIGHT) not working** — the keypad indev reads keys correctly
    (`lv_port_indev.c` maps SCAN_UP → LV_KEY_UP etc.), but LVGL's default group navigation
    uses LV_KEY_NEXT/LV_KEY_PREV (Tab/Shift-Tab). Arrow keys only work inside widgets
