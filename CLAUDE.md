@@ -352,13 +352,17 @@ git rebase master
    `OnNavKey` (per-widget LV_EVENT_KEY callback), which does receive key
    events via `lv_group_send_data`. Non-editing ESC sets
    `BROWSER_ACTION_FORM_EXIT`; editing ESC cancels editing.
-3. **`EFI_IFR_ORDERED_LIST_OP` not rendered** — "Change Boot Order" and
-   "Change Driver Order" forms come up empty because the statement switch
-   in `LvglFormRenderer.c:710-743` has no case for ordered-list opcodes.
-   Needs a `CreateOrderedListWidget` that walks `Statement->OptionListHead`
-   in current order, offers a reorder affordance (Move Up / Move Down or
-   drag), and writes the new order back into `Statement->CurrentValue` so
-   `RouteConfig` picks it up.
+3. ~~**`EFI_IFR_ORDERED_LIST_OP` not rendered**~~ — **FIXED**.
+   `CreateOrderedListWidget` in `LvglFormRenderer.c` walks
+   `Statement->CurrentValue.Buffer` using local `GetArrayData`/`SetArrayData`
+   helpers (ported from `MdeModulePkg/Universal/DisplayEngineDxe/ProcessOptions.c`),
+   renders one row per active entry with Up/Down buttons, and on click emits
+   the reordered buffer via `USER_INPUT.InputValue.Buffer` + exit so
+   SetupBrowserDxe re-invokes `FormDisplay()` with the new state. Option
+   value lookup reads `Option->OptionOpCode->Value` at its native width
+   (u8/u16/u32/u64 per `ValueType` = first option's `OpCode->Type`) — a
+   raw `.u64` read would over-read past the IFR-sized value into
+   neighboring bytes and break the label match.
 4. **Fonts and colors need improvement** — current dark theme (0x1A1A2E / 0x16213E) is
    placeholder. Text readability is poor, subtitle/label contrast is insufficient.
    Need a proper theme pass: background, panel, text, accent, and disabled colors.
@@ -371,7 +375,6 @@ git rebase master
    `BROWSER_ACTION_*`.
 
 ## Next Steps
-1. Implement `CreateOrderedListWidget` for Boot Order / Driver Order forms
-2. Surface F-keys from `lv_port_indev.c` and walk `HotKeyListHead` for F9/F10
-3. Theme/styling pass — readable fonts, proper color palette, grayout styling
-4. End-to-end test — verify form navigation, value changes, and save/discard flow
+1. Surface F-keys from `lv_port_indev.c` and walk `HotKeyListHead` for F9/F10
+2. Theme/styling pass — readable fonts, proper color palette, grayout styling
+3. End-to-end test — verify form navigation, value changes, and save/discard flow
