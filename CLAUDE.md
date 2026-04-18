@@ -340,6 +340,10 @@ git rebase master
   `LvglFormRenderer.c` give UP/DOWN focus, ESC form-exit, and
   ENTER-toggles-editing for spinbox/dropdown/textarea (LEFT/RIGHT adjust
   value via LVGL encoder emulation while editing)
+- String field commit: **done** — `OnStringReady` allocates a zero-filled pool buffer
+  (`AllocateZeroPool(CurrentValue.BufferLen)`) and calls `HiiSetString` to create a
+  fresh string token. SetupBrowserDxe's `FreePool(InputValue.Buffer)` no longer asserts,
+  and `CopyMem(BufferValue, Buffer, BufferLen)` fills storage correctly.
 
 ## Known Bugs
 1. ~~**Arrow keys (UP/DOWN/LEFT/RIGHT) not working**~~ — **FIXED**. `OnNavKey`
@@ -363,11 +367,21 @@ git rebase master
    (u8/u16/u32/u64 per `ValueType` = first option's `OpCode->Type`) — a
    raw `.u64` read would over-read past the IFR-sized value into
    neighboring bytes and break the label match.
-4. **Fonts and colors need improvement** — current dark theme (0x1A1A2E / 0x16213E) is
+4. ~~**ASSERT on Enter in string textarea**~~ — **FIXED**. `OnStringReady` in
+   `LvglFormRenderer.c` now allocates a real pool buffer via
+   `AllocateZeroPool(CurrentValue.BufferLen)` and sets `InputValue.Buffer`,
+   `InputValue.BufferLen`, and `InputValue.Value.string` (via `HiiSetString`)
+   to satisfy SetupBrowserDxe's `ProcessUserInput` contract. Fallback to
+   `EFI_IFR_STRING.MaxSize * sizeof(CHAR16)` when `CurrentValue.BufferLen == 0`.
+5. **"Submit fail" on some HII drivers (e.g. iPXE)** — **NOT our bug**. Investigated:
+   the original `DisplayEngineDxe` exhibits the same behavior. The failure is in the
+   driver's own `RouteConfig()` implementation rejecting the config string. There is
+   nothing to fix in the display engine for this case.
+6. **Fonts and colors need improvement** — current dark theme (0x1A1A2E / 0x16213E) is
    placeholder. Text readability is poor, subtitle/label contrast is insufficient.
    Need a proper theme pass: background, panel, text, accent, and disabled colors.
    Font sizes should be consistent and appropriate for 800x600 resolution.
-5. **Function-key hotkeys not wired** — `LvglFormRenderer.c` ignores
+7. **Function-key hotkeys not wired** — `LvglFormRenderer.c` ignores
    `FormData->HotKeyListHead`, so F9 (Load Defaults), F10 (Save), and any
    driver-registered hotkeys do nothing. `lv_port_indev.c` also drops
    `SCAN_F1..F12` silently and would need to surface them before the
