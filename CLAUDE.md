@@ -387,6 +387,25 @@ git rebase master
    `SCAN_F1..F12` silently and would need to surface them before the
    renderer can walk the hotkey list and return the corresponding
    `BROWSER_ACTION_*`.
+8. **Mouse-wheel scrolling unreliable in HII forms** — `mouse_read` in
+   `LvglPkg/Library/LvglLib/lv_port_indev.c` ratchets QEMU usb-mouse Z
+   into a `wheel_step` and calls `lv_obj_scroll_by_bounded` on the
+   first scrollable ancestor under the cursor (skipping textareas,
+   dropdowns, dropdown-list, and the screen). Symptoms still seen:
+   - "Cannot scroll down at the top of the page until I scroll up
+     first" — first wheel tick after entering a form does nothing,
+     subsequent ticks work.
+   - "Cannot reach the bottom row without dragging" — wheel halts
+     partway down.
+   Tried: bounds gate via `scroll_top + scroll_bottom`, outermost-
+   scrollable selection, forced `lv_obj_update_layout`, class-based
+   skip of leaf-trap widgets, sign flips on `wheel_step`. None gave
+   consistent behavior. LVGL's built-in `indev_proc_pointer_diff`
+   (`lv_indev.c:1620`) requires `pointer.last_pressed != NULL`, which
+   explains why the wheel "wakes up" only after a manual drag — but
+   bypassing that path manually (current approach) still misbehaves.
+   Likely deeper issue with cursor hit-testing or LVGL scroll state
+   right after `BuildFormUi()`. Workaround: drag once, then wheel.
 
 ## Next Steps
 1. Surface F-keys from `lv_port_indev.c` and walk `HotKeyListHead` for F9/F10
