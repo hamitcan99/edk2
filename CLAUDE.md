@@ -306,6 +306,13 @@ MdePkg/Include/Protocol/HiiConfigAccess.h             ← EFI_HII_CONFIG_ACCESS_
 
 # Reference VFR/HII driver
 MdeModulePkg/Universal/DriverSampleDxe/          ← Best VFR/HII example
+
+# Theme / chrome
+LvglPkg/Include/LvglTheme.h                      ← User-customizable color palette and fonts
+LvglPkg/LvglDisplayEngineDxe/LvglAptioChrome.c  ← Aptio-style frame: title bar, help pane,
+                                                   footer hotkey bar (BuildFooter walks HotKeyListHead,
+                                                   renders HelpString chips via AddHotKeyChip)
+LvglPkg/LvglDisplayEngineDxe/AptioWallpaper.c   ← Background wallpaper
 ```
 
 ## LvglDisplayEngineDxe Module (created)
@@ -315,6 +322,12 @@ LvglPkg/LvglDisplayEngineDxe/
   LvglDisplayEngineDxe.inf   ← module INF
   LvglFormRenderer.c         ← FormDisplay(): FORM_DISPLAY_ENGINE_FORM → LVGL widgets
   LvglFormRenderer.h         ← Renderer types and API
+  LvglAptioChrome.c          ← Aptio-style chrome: title bar, help pane, footer hotkey bar
+  LvglAptioChrome.h          ← Chrome API
+  AptioWallpaper.c           ← Background wallpaper rendering
+
+LvglPkg/Include/
+  LvglTheme.h                ← User-customizable color palette and font table
 ```
 
 ## Toolchain Info
@@ -438,6 +451,14 @@ Changes:
 - LVGL built-in pointer indev (Branch 2): adopted then reverted in Branch 3 — built-in
   `lv_uefi_absolute_pointer_indev` discards `CurrentZ` (wheel axis), and a separate
   Z-poller would race `GetState()`. Custom `mouse_read` reinstated (PR #3 → PR #4).
+- F-key hotkey wiring: **done** — `HandleFunctionKey()` (`LvglFormRenderer.c:874-930`)
+  walks `HotKeyListHead`, maps `LV_KEY_Fn → SCAN_Fn`, shows confirm popup for
+  SUBMIT/DEFAULT actions, exits immediately for others.
+- Theme pass: **done** — NovaCore palette, user-customizable via `LvglPkg/Include/LvglTheme.h`.
+- Aptio-style chrome: **done** — `LvglAptioChrome.c/.h` (title bar, help pane, dynamic
+  footer hotkey bar with registered key labels); `AptioWallpaper.c` (background).
+- Mouse hover highlight: **done** — focused form row is highlighted on hover.
+- Bottom-docked on-screen keyboard: **done** — appears when a text/password field is focused.
 
 ## Known Bugs
 1. ~~**Arrow keys (UP/DOWN/LEFT/RIGHT) not working**~~ — **FIXED**. `OnNavKey`
@@ -471,16 +492,20 @@ Changes:
    the original `DisplayEngineDxe` exhibits the same behavior. The failure is in the
    driver's own `RouteConfig()` implementation rejecting the config string. There is
    nothing to fix in the display engine for this case.
-6. **Fonts and colors need improvement** — current dark theme (0x1A1A2E / 0x16213E) is
-   placeholder. Text readability is poor, subtitle/label contrast is insufficient.
-   Need a proper theme pass: background, panel, text, accent, and disabled colors.
-   Font sizes should be consistent and appropriate for 800x600 resolution.
-7. **Function-key hotkeys not wired** — `LvglFormRenderer.c` ignores
-   `FormData->HotKeyListHead`, so F9 (Load Defaults), F10 (Save), and any
-   driver-registered hotkeys do nothing. `lv_port_indev.c` custom `keypad_read`
-   does surface `SCAN_F1..F12` as `LV_KEY_F1..F12` — the key codes reach the
-   renderer — but `LvglFormRenderer.c` still needs to walk `HotKeyListHead` and
-   return the corresponding `BROWSER_ACTION_*`.
+6. ~~**Fonts and colors need improvement**~~ — **ADDRESSED**. The placeholder dark
+   theme (0x1A1A2E / 0x16213E) was replaced by the NovaCore palette (Aptio-style
+   chrome) and a user-customizable color/font table at `LvglPkg/Include/LvglTheme.h`.
+   Styling remains iterative, but the placeholder concern is resolved.
+7. ~~**Function-key hotkeys not wired**~~ — **FIXED**. `HandleFunctionKey()` in
+   `LvglFormRenderer.c:874-930` walks `FormData->HotKeyListHead`, maps
+   `LV_KEY_Fn → SCAN_Fn` (reverse of the `keypad_read` translation), and matches by
+   `ScanCode + UnicodeChar == CHAR_NULL`. Actions that require confirmation
+   (`BROWSER_ACTION_SUBMIT | BROWSER_ACTION_DEFAULT`) show a confirm popup before
+   exiting; others (Reset/Exit) set `UserInput->Action` and `ExitRequested` immediately.
+   The function is invoked from both `OnNavKey` (`:1204`, focused widget) and
+   `OnIndevFallbackKey` (`:1009`, global fallback when nothing focusable is focused).
+   The footer hotkey bar (`LvglAptioChrome.c:269-337`) surfaces each registered
+   hotkey's `HelpString` as a labelled chip so the user can see F9/F10 hints.
 8. ~~**Mouse-wheel scrolling not ported**~~ — **FIXED** (Branch 3 / PR #4).
    Custom `mouse_read` reads `CurrentZ` in the same `GetState()` call used for X/Y,
    accumulates delta vs `mLastAbsZ`, ratchets via `LVGL_WHEEL_COUNTS_PER_DETENT=8`,
@@ -495,9 +520,17 @@ Changes:
 All tasks complete: mouse wheel re-ported, dead built-in indev sources removed, docs
 updated.
 
+### Post-Branch-3 work ✅ DONE
+1. ~~**Wire F-key hotkeys**~~ — **DONE**. `HandleFunctionKey()` in `LvglFormRenderer.c`
+   walks `HotKeyListHead`, matches scan codes, returns `BROWSER_ACTION_*` with confirm
+   popup for destructive actions. Footer hotkey bar surfaces registered key hints.
+2. ~~**Theme/styling pass**~~ — **DONE**. User-customizable palette via
+   `LvglPkg/Include/LvglTheme.h`; Aptio-style chrome with header, help pane, and
+   dynamic hotkey footer (`LvglAptioChrome.c`); background wallpaper (`AptioWallpaper.c`);
+   mouse hover highlight for form rows; bottom-docked on-screen keyboard.
+
 ### Next up
-1. **Wire F-key hotkeys** — walk `FormData->HotKeyListHead` in `LvglFormRenderer.c`
-   and return the corresponding `BROWSER_ACTION_*` (F-keys already reach renderer
-   via custom `keypad_read`)
-2. **Theme/styling pass** — readable fonts, proper color palette, grayout styling
-3. End-to-end test — form navigation, value changes, save/discard flow
+1. **End-to-end test** — build OVMF + LvglPkg, run in QEMU, and verify form navigation,
+   value changes, save/discard flow, and F9 (Load Defaults) / F10 (Save) hotkeys.
+2. **True 1:1 absolute mouse tracking** — out of scope for now; synthesized absolute is
+   sufficient. Would require a custom HID-class AbsolutePointer driver for `usb-tablet`.
