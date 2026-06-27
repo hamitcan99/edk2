@@ -219,13 +219,25 @@ Everything above that line — UNI, VFR, IFR, HII database, SetupBrowserDxe,
 driver EFI_HII_CONFIG_ACCESS_PROTOCOL — is completely untouched.
 
 ## Mouse/Input Status
-- **AbsolutePointer**: ✅ Working with QEMU `usb-mouse` via `UsbMouseAbsolutePointerDxe`.
-  Note: this is *synthesized* absolute (the driver accumulates Boot Mouse relative
-  deltas internally) — not true 1:1 host→guest tracking. Cursor moves proportionally
-  to host motion but does not directly mirror the QEMU window's host pointer.
-- **SimplePointer**: Available as fallback in `lv_port_indev.c` if AbsolutePointer
-  is absent, but currently unused.
-- **Keyboard**: ✅ Working via `EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL`
+- **AbsolutePointer + Mouse Wheel**: ✅ Working with QEMU `usb-mouse` via
+  `UsbMouseAbsolutePointerDxe`. A single custom `mouse_read` callback owns the one
+  `GetState()` call per frame, handling X/Y rescaling, left-button state, and Z-axis
+  wheel accumulation together. This is race-free: `GetState()` is single-consumer (the
+  USB driver clears `StateChanged` on each read), so a separate wheel poller would steal
+  cursor events. PR#17 lazy-binding via `RegisterProtocolNotify` preserved.
+  Note: synthesized absolute — cursor moves proportionally but does not mirror the host
+  pointer 1:1. Wheel ratchet: 8 raw Z counts per scroll step, 40 px per detent.
+- **SimplePointer**: Removed — no longer used. The QEMU setup only produces
+  `EFI_ABSOLUTE_POINTER_PROTOCOL` (UsbMouseDxe intentionally excluded).
+  The old SimplePointer code path in `GetXYZ`/`EfiMouseInit` was dead code and has been
+  removed.
+- **Keyboard**: ✅ Working via custom `keypad_read` callback in `lv_port_indev.c`.
+  Uses `EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL` directly: returns `PRESSED` while the EFI
+  buffer holds a key, `RELEASED` when empty. This is the correct model for UEFI's
+  press-only (no key-up) protocol and lets LVGL's `long_press_repeat` throttle control
+  navigation rate. The built-in `lv_uefi_simple_text_input_indev` was tried but caused
+  runaway navigation (PRESSED+RELEASED per keystroke in the same tick bypasses
+  LVGL's rate limiting).
 
 ### How AbsolutePointer is wired
 - `OvmfPkgX64.fdf` and `OvmfPkg/Include/Dsc/UsbComponents.dsc.inc` include
@@ -246,19 +258,33 @@ report descriptor, range 0..32767). Out of scope for now — synthesized absolut
 sufficient for current LVGL development.
 
 ### Mouse Input Design (lv_port_indev.c)
-Uses `ConsoleInHandle` to get pointer protocols via ConSplitter aggregate.
+Uses `ConsoleInHandle` to reach the ConSplitter aggregate for both mouse and wheel.
 ConSplitter installs `EFI_ABSOLUTE_POINTER_PROTOCOL` on its VirtualHandle
-(= `gST->ConsoleInHandle`) at driver entry, then aggregates all physical
-devices as they bind. `GetState()` iterates the internal device list and
-rescales coordinates to a virtual range. This is the correct UEFI pattern
-— no need to use `LocateHandleBuffer` to find individual devices.
+(= `gST->ConsoleInHandle`) at driver entry, then aggregates all physical devices as
+they bind. `GetState()` iterates the internal device list and rescales coordinates to a
+virtual range. This is the correct UEFI pattern — no `LocateHandleBuffer` needed.
+
+**Single-consumer constraint**: `GetState()` clears the physical device's `StateChanged`
+flag on each read (see `GetMouseAbsolutePointerState`, `UsbMouseAbsolutePointer.c:911`).
+Therefore mouse X/Y AND wheel Z must be read in the same `GetState()` call. The custom
+`mouse_read` callback does this. The built-in `lv_uefi_absolute_pointer_indev` was
+reverted because it discards `CurrentZ` and there is no race-free way to add a separate
+Z-poller. The built-in **display** backend is still used (`lv_uefi_display_create`).
 
 ## Key Source Files
 ```
-# LVGL UEFI port (existing)
-LvglPkg/Library/LvglLib/lv_uefi_display.c   ← GOP flush callback
-LvglPkg/Library/LvglLib/lv_port_indev.c     ← Mouse + keyboard input
+# LVGL UEFI port
 LvglPkg/Library/LvglLib/LvglLib.c           ← Init/deinit, main loop
+LvglPkg/Library/LvglLib/lv_port_indev.c     ← Mouse (custom: X/Y/buttons/wheel in one GetState) + keyboard (custom)
+LvglPkg/Library/LvglLib/lv_conf.h           ← LV_USE_UEFI=1, LV_USE_UEFI_INCLUDE
+
+# LVGL built-in UEFI driver (vendored, read-only)
+LvglPkg/Library/LvglLib/lvgl/src/drivers/uefi/lv_uefi_display.c      ← GOP flush (replaces old lv_uefi_display.c)
+LvglPkg/Library/LvglLib/lvgl/src/drivers/uefi/lv_uefi_indev_pointer.c ← absolute pointer indev
+LvglPkg/Library/LvglLib/lvgl/src/drivers/uefi/lv_uefi_indev_keyboard.c ← NOT compiled (removed from LvglLib.inf; keyboard uses custom keypad_read)
+LvglPkg/Library/LvglLib/lvgl/src/drivers/uefi/lv_uefi_indev_pointer.c  ← NOT compiled (removed; pointer uses custom mouse_read)
+LvglPkg/Library/LvglLib/lvgl/src/drivers/uefi/lv_uefi_indev_touch.c    ← NOT compiled (removed; discards Z axis, replaced by custom mouse_read)
+LvglPkg/Library/LvglLib/lvgl/src/drivers/uefi/lv_uefi_edk2.h         ← EDK2 framework binding
 
 # Display Engine — the seam we implement
 MdeModulePkg/Include/Protocol/DisplayProtocol.h         ← EFI_DISPLAY_ENGINE_PROTOCOL
@@ -327,23 +353,91 @@ git rebase master
 - **PR #17** (pr/mouse-notify): Lazy mouse indev creation via `RegisterProtocolNotify` — fixes unusable mouse when LvglLib is consumed by a DXE_DRIVER (USB not connected at constructor time)
 - **PR #13** (closed): Original combined PR, split into #14/#15/#16 per maintainer request
 
+## hamitcan99/LvglPkg PRs (internal feature branches)
+- **PR #2** (feat/lvgl-builtin-display): Switch display backend to LVGL's built-in UEFI driver — `LV_USE_UEFI=1`, delete project's `lv_uefi_display.c`, use `lv_uefi_display_create()`
+- **PR #3** (feat/lvgl-builtin-input): Switch pointer to built-in `lv_uefi_absolute_pointer_indev`; restore custom `keypad_read` for keyboard (built-in keyboard caused runaway navigation)
+- **PR #4** (feat/lvgl-builtin-cleanup): Re-port mouse-wheel scrolling — revert pointer to custom `mouse_read` for race-free single-`GetState()` X/Y+wheel; remove dead built-in indev sources from LvglLib.inf; update docs
+
+## LVGL Built-in UEFI Driver Migration Plan
+
+LVGL v9.5 ships a built-in UEFI backend at `lvgl/src/drivers/uefi/`.  The goal is to
+replace the project's ~750-line hand-written glue (custom GOP flush + custom pointer/
+keyboard polling) with the upstream driver, keeping only the pieces the built-in does
+not provide.
+
+### Branch 1 — `feat/lvgl-builtin-display` ✅ DONE (hamitcan99/LvglPkg PR #2)
+**Goal**: swap the GOP display backend to the built-in driver.
+
+Changes:
+- `lv_conf.h`: `LV_USE_UEFI 0` → `1`, `LV_USE_UEFI_INCLUDE` → `"lv_uefi_edk2.h"`
+- `LvglLib.c`: `lv_uefi_init(gImageHandle, gST)` before `lv_init()`; replace
+  `lv_uefi_disp_create()` with `lv_uefi_display_get_any()` + `lv_uefi_display_create()`
+- Delete `Library/LvglLib/lv_uefi_display.c` (83-line custom GOP flush, now replaced)
+- `LvglLib.inf`: remove `lv_uefi_display.c` from `[Sources]`; built-in files at
+  `lvgl/src/drivers/uefi/` now compile because `LV_USE_UEFI=1`
+
+Key insight: `lv_uefi_display_create()` uses GOP only — no EDID at runtime.
+`LV_USE_UEFI_INCLUDE "lv_uefi_edk2.h"` resolves from `lv_uefi.h`'s own directory.
+
+### Branch 2 — `feat/lvgl-builtin-input` ✅ DONE (hamitcan99/LvglPkg PR #3)
+**Goal**: replace pointer glue with built-in `lv_uefi_absolute_pointer_indev`;
+fix keyboard to not cause runaway navigation.
+
+Changes:
+- **Pointer**: `lv_uefi_absolute_pointer_indev_create(&res)` + `add_handle(ConsoleInHandle)`
+  replaces the custom `LVGL_UEFI_MOUSE` struct, `GetXYZ`, `EfiMouseInit`, `mouse_read`
+- **PR#17 lazy-binding**: kept — `RegisterProtocolNotify(gEfiAbsolutePointerProtocolGuid)`
+  retries `add_handle` until ConSplitter's Mode becomes valid after USB binds
+- **Keyboard**: the built-in `lv_uefi_simple_text_input_indev` was tried and reverted.
+  Root cause: it queues PRESSED+RELEASED for each EFI keystroke via `continue_reading`,
+  delivering both in the same LVGL tick. LVGL's `indev_keypad_proc` never sees the key
+  as held, so `long_press_repeat` throttle never fires. EFI auto-repeat (~33 Hz) then
+  caused uncontrolled navigation. Custom `keypad_read` restored: returns `PRESSED` while
+  EFI buffer is non-empty, `RELEASED` when empty — correct model for UEFI's press-only
+  protocol.
+- `lv_uefi_keypad_drain()` preserved (called from `LvglFormRenderer.c`)
+- `LV_KEY_F1..F12` defines preserved in `lv_port_indev.h` and `Include/Library/LvglLib.h`
+
+Known temporary regressions vs pre-migration:
+- ~~Mouse wheel not re-ported (built-in pointer indev discards Z axis)~~ **Fixed in Branch 3**
+
+### Branch 3 — `feat/lvgl-builtin-cleanup` ✅ DONE (hamitcan99/LvglPkg PR #4)
+**Goal**: re-port mouse wheel, remove dead built-in indev sources, update docs.
+
+Changes:
+- **Mouse wheel**: reverted pointer to custom `mouse_read` — single `GetState()` call
+  per frame handles X/Y/buttons AND `CurrentZ` wheel accumulation. Race-free by design
+  (see "Single-consumer constraint" in Mouse Input Design). `find_scrollable_at_point`
+  + ratchet (`LVGL_WHEEL_COUNTS_PER_DETENT=8`, 40 px/detent) re-ported from pre-Branch-2
+  history. Dead `SimplePointer` code path removed.
+- **LvglLib.inf**: removed `lv_uefi_indev_keyboard.c`, `lv_uefi_indev_pointer.c`,
+  `lv_uefi_indev_touch.c` from `[Sources]` — no longer compiled.
+- Docs updated throughout.
+
 ## Current Status
 - LvglDisplayEngineDxe skeleton: **done** — builds, installs protocol, wired into DSC/FDF
 - LvglLib.inf fix: **done** — removed `UefiApplicationEntryPoint`, consumable by DXE_DRIVER
 - FormDisplay() initial implementation: **done** — walks StatementListHead, creates LVGL widgets,
   runs event loop, returns user action to browser
 - LVGL-based form UI renders on screen in QEMU when entering Setup
-- Mouse input fix: **done** — `lv_uefi_mouse_create()` idempotent, `lv_port_indev_init()`
-  registers a `RegisterProtocolNotify()` on `gEfiAbsolutePointerProtocolGuid` so the
-  mouse indev is created lazily when USB binds during BDS (PR #17)
-- Keyboard navigation: **done** — `OnNavKey` + `AddToNavGroup` in
-  `LvglFormRenderer.c` give UP/DOWN focus, ESC form-exit, and
-  ENTER-toggles-editing for spinbox/dropdown/textarea (LEFT/RIGHT adjust
-  value via LVGL encoder emulation while editing)
+- Mouse input: **done** — custom `mouse_read` callback: single `GetState()` call for
+  X/Y/buttons + Z-axis wheel accumulation; PR#17 `RegisterProtocolNotify` lazy-binding
+  preserved so mouse works when USB binds during BDS
+- Mouse wheel scrolling: **done** — `find_scrollable_at_point` + ratchet
+  (`LVGL_WHEEL_COUNTS_PER_DETENT=8`, 40 px/detent) via `lv_obj_scroll_by_bounded`;
+  race-free because `GetState()` is called only once per frame in `mouse_read`
+- Keyboard navigation: **done** — custom `keypad_read` callback (PRESSED while EFI buffer
+  non-empty, RELEASED when empty) + `OnNavKey`/`AddToNavGroup` in `LvglFormRenderer.c`
+  give UP/DOWN focus, ESC form-exit, ENTER-toggles-editing for spinbox/dropdown/textarea
 - String field commit: **done** — `OnStringReady` allocates a zero-filled pool buffer
   (`AllocateZeroPool(CurrentValue.BufferLen)`) and calls `HiiSetString` to create a
   fresh string token. SetupBrowserDxe's `FreePool(InputValue.Buffer)` no longer asserts,
   and `CopyMem(BufferValue, Buffer, BufferLen)` fills storage correctly.
+- LVGL built-in display backend: **done** — `LV_USE_UEFI=1`, built-in GOP flush via
+  `lv_uefi_display_create()`, deleted project's custom `lv_uefi_display.c` (PR #2)
+- LVGL built-in pointer indev (Branch 2): adopted then reverted in Branch 3 — built-in
+  `lv_uefi_absolute_pointer_indev` discards `CurrentZ` (wheel axis), and a separate
+  Z-poller would race `GetState()`. Custom `mouse_read` reinstated (PR #3 → PR #4).
 
 ## Known Bugs
 1. ~~**Arrow keys (UP/DOWN/LEFT/RIGHT) not working**~~ — **FIXED**. `OnNavKey`
@@ -383,31 +477,27 @@ git rebase master
    Font sizes should be consistent and appropriate for 800x600 resolution.
 7. **Function-key hotkeys not wired** — `LvglFormRenderer.c` ignores
    `FormData->HotKeyListHead`, so F9 (Load Defaults), F10 (Save), and any
-   driver-registered hotkeys do nothing. `lv_port_indev.c` also drops
-   `SCAN_F1..F12` silently and would need to surface them before the
-   renderer can walk the hotkey list and return the corresponding
-   `BROWSER_ACTION_*`.
-8. **Mouse-wheel scrolling unreliable in HII forms** — `mouse_read` in
-   `LvglPkg/Library/LvglLib/lv_port_indev.c` ratchets QEMU usb-mouse Z
-   into a `wheel_step` and calls `lv_obj_scroll_by_bounded` on the
-   first scrollable ancestor under the cursor (skipping textareas,
-   dropdowns, dropdown-list, and the screen). Symptoms still seen:
-   - "Cannot scroll down at the top of the page until I scroll up
-     first" — first wheel tick after entering a form does nothing,
-     subsequent ticks work.
-   - "Cannot reach the bottom row without dragging" — wheel halts
-     partway down.
-   Tried: bounds gate via `scroll_top + scroll_bottom`, outermost-
-   scrollable selection, forced `lv_obj_update_layout`, class-based
-   skip of leaf-trap widgets, sign flips on `wheel_step`. None gave
-   consistent behavior. LVGL's built-in `indev_proc_pointer_diff`
-   (`lv_indev.c:1620`) requires `pointer.last_pressed != NULL`, which
-   explains why the wheel "wakes up" only after a manual drag — but
-   bypassing that path manually (current approach) still misbehaves.
-   Likely deeper issue with cursor hit-testing or LVGL scroll state
-   right after `BuildFormUi()`. Workaround: drag once, then wheel.
+   driver-registered hotkeys do nothing. `lv_port_indev.c` custom `keypad_read`
+   does surface `SCAN_F1..F12` as `LV_KEY_F1..F12` — the key codes reach the
+   renderer — but `LvglFormRenderer.c` still needs to walk `HotKeyListHead` and
+   return the corresponding `BROWSER_ACTION_*`.
+8. ~~**Mouse-wheel scrolling not ported**~~ — **FIXED** (Branch 3 / PR #4).
+   Custom `mouse_read` reads `CurrentZ` in the same `GetState()` call used for X/Y,
+   accumulates delta vs `mLastAbsZ`, ratchets via `LVGL_WHEEL_COUNTS_PER_DETENT=8`,
+   and calls `lv_obj_scroll_by_bounded` on the scrollable ancestor under the cursor
+   via `find_scrollable_at_point`. Built-in `lv_uefi_absolute_pointer_indev` was
+   reverted because it discards `CurrentZ` and a separate Z-poller would race
+   `GetState()` (single-consumer, clears `StateChanged` on each read).
 
 ## Next Steps
-1. Surface F-keys from `lv_port_indev.c` and walk `HotKeyListHead` for F9/F10
-2. Theme/styling pass — readable fonts, proper color palette, grayout styling
-3. End-to-end test — verify form navigation, value changes, and save/discard flow
+
+### Branch 3 — `feat/lvgl-builtin-cleanup` ✅ DONE (PR #4)
+All tasks complete: mouse wheel re-ported, dead built-in indev sources removed, docs
+updated.
+
+### Next up
+1. **Wire F-key hotkeys** — walk `FormData->HotKeyListHead` in `LvglFormRenderer.c`
+   and return the corresponding `BROWSER_ACTION_*` (F-keys already reach renderer
+   via custom `keypad_read`)
+2. **Theme/styling pass** — readable fonts, proper color palette, grayout styling
+3. End-to-end test — form navigation, value changes, save/discard flow
