@@ -521,17 +521,21 @@ Changes:
    (where `Ctx` is available) that calls `GetHelpUtf8` + `AptioSetHelpText`; on
    `LV_EVENT_HOVER_LEAVE` restore the keyboard-focused item's help by tracking the
    last focused `LVGL_STATEMENT_CONTEXT *` in a module-level static.
-10. **UP/DOWN doesn't cycle a focused dropdown** — `OnIndevFallbackKey` in
-    `LvglFormRenderer.c` treats UP/DOWN as row-focus navigation for every widget. A
-    focused-but-closed ONE_OF dropdown (e.g. "Boot Next Value") therefore loses focus
-    to the neighbouring question instead of changing its value. Planned fix: in
-    `OnIndevFallbackKey`, detect when the focused widget is a closed, non-editing
-    `lv_dropdown` (via `lv_obj_check_type` + `!lv_dropdown_is_open` +
-    `!lv_group_get_editing`) and cycle `lv_dropdown_set_selected` using
-    `lv_dropdown_get_option_count` with wrap-around. Because `lv_dropdown_set_selected`
-    does **not** emit `LV_EVENT_VALUE_CHANGED` itself, fire
-    `lv_obj_send_event(Dd, LV_EVENT_VALUE_CHANGED, NULL)` explicitly so
-    `OnDropdownChanged` commits the new value and exits to SetupBrowserDxe.
+10. ~~**UP/DOWN doesn't cycle a focused dropdown**~~ — **FIXED**. Dropdown keyboard
+    navigation now follows the standard BIOS-setup model: UP/DOWN on a focused
+    (non-editing) dropdown moves between form rows as normal. Press ENTER to enter
+    editing mode; now UP/DOWN cycles the dropdown's options **locally** with wrap-around
+    (no commit, no form rebuild). Press ENTER again to confirm and commit once; ESC
+    reverts the selection to what it was when editing began and exits editing without
+    committing; moving focus away (mouse click, etc.) while editing commits once via
+    `OnDropdownDefocused`. Implemented in `LvglFormRenderer.c`: two module statics
+    (`mEditingDropdown`, `mEditingDropdownOrigSel`), `OnDropdownDefocused` handler,
+    modified `OnIndevFallbackKey` (cycles only when `lv_group_get_editing`, no
+    `LV_EVENT_VALUE_CHANGED`), modified `OnNavKey` (ENTER-confirm dispatches
+    `LV_EVENT_VALUE_CHANGED`; ESC reverts via `mEditingDropdownOrigSel`; ENTER-to-edit
+    snapshots the original selection). Note: commit `e502755` implemented the inverse
+    behavior (cycle-on-focus without editing, commit-per-keystroke) and is superseded
+    by this fix.
 
 ## Next Steps
 
@@ -556,6 +560,4 @@ updated.
 3. **Help pane follows mouse hover** — see Known Bug #9. Extend `AddToNavGroup` with
    `LV_EVENT_HOVER_OVER`/`LV_EVENT_HOVER_LEAVE` callbacks and a static to track the
    last focused `LVGL_STATEMENT_CONTEXT`.
-4. **UP/DOWN cycles a focused dropdown** — see Known Bug #10. Add a dropdown special-case
-   to `OnIndevFallbackKey` before the generic row-nav logic; remember to send
-   `LV_EVENT_VALUE_CHANGED` manually after `lv_dropdown_set_selected`.
+4. ~~**UP/DOWN cycles a focused dropdown**~~ — **DONE**. See Known Bug #10 above.
