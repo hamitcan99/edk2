@@ -513,6 +513,25 @@ Changes:
    via `find_scrollable_at_point`. Built-in `lv_uefi_absolute_pointer_indev` was
    reverted because it discards `CurrentZ` and a separate Z-poller would race
    `GetState()` (single-consumer, clears `StateChanged` on each read).
+9. **Help pane does not follow mouse hover** — `OnFocusUpdateHelp` in
+   `LvglFormRenderer.c` only fires on `LV_EVENT_FOCUSED` (keyboard focus). Hovering
+   a row updates the visual highlight via `OnRowHoverChange`/`BindRowHover`, but the
+   right-side help pane text stays on the last keyboard-focused item. Planned fix:
+   register an additional callback on `LV_EVENT_HOVER_OVER` inside `AddToNavGroup`
+   (where `Ctx` is available) that calls `GetHelpUtf8` + `AptioSetHelpText`; on
+   `LV_EVENT_HOVER_LEAVE` restore the keyboard-focused item's help by tracking the
+   last focused `LVGL_STATEMENT_CONTEXT *` in a module-level static.
+10. **UP/DOWN doesn't cycle a focused dropdown** — `OnIndevFallbackKey` in
+    `LvglFormRenderer.c` treats UP/DOWN as row-focus navigation for every widget. A
+    focused-but-closed ONE_OF dropdown (e.g. "Boot Next Value") therefore loses focus
+    to the neighbouring question instead of changing its value. Planned fix: in
+    `OnIndevFallbackKey`, detect when the focused widget is a closed, non-editing
+    `lv_dropdown` (via `lv_obj_check_type` + `!lv_dropdown_is_open` +
+    `!lv_group_get_editing`) and cycle `lv_dropdown_set_selected` using
+    `lv_dropdown_get_option_count` with wrap-around. Because `lv_dropdown_set_selected`
+    does **not** emit `LV_EVENT_VALUE_CHANGED` itself, fire
+    `lv_obj_send_event(Dd, LV_EVENT_VALUE_CHANGED, NULL)` explicitly so
+    `OnDropdownChanged` commits the new value and exits to SetupBrowserDxe.
 
 ## Next Steps
 
@@ -534,3 +553,9 @@ updated.
    value changes, save/discard flow, and F9 (Load Defaults) / F10 (Save) hotkeys.
 2. **True 1:1 absolute mouse tracking** — out of scope for now; synthesized absolute is
    sufficient. Would require a custom HID-class AbsolutePointer driver for `usb-tablet`.
+3. **Help pane follows mouse hover** — see Known Bug #9. Extend `AddToNavGroup` with
+   `LV_EVENT_HOVER_OVER`/`LV_EVENT_HOVER_LEAVE` callbacks and a static to track the
+   last focused `LVGL_STATEMENT_CONTEXT`.
+4. **UP/DOWN cycles a focused dropdown** — see Known Bug #10. Add a dropdown special-case
+   to `OnIndevFallbackKey` before the generic row-nav logic; remember to send
+   `LV_EVENT_VALUE_CHANGED` manually after `lv_dropdown_set_selected`.
